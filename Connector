@@ -1,5 +1,5 @@
 -- =====================================================================
--- LeafyAI Unified Client (Death Reset, Thought Leak Fix, Adrenaline)
+-- LeafyAI Unified Client (10s Timeout, Death Reset, Adrenaline)
 -- =====================================================================
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -47,9 +47,7 @@ function DigitalAwareness.scanEnvironment()
         wall_distances = {}
     }
     
-    if hum.Health < lastHealth then 
-        map.took_damage = true 
-    end
+    if hum.Health < lastHealth then map.took_damage = true end
     lastHealth = hum.Health
     
     local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -103,39 +101,53 @@ function DigitalAwareness.scanEnvironment()
 end
 
 -- =====================================================================
--- COMMUNICATION
+-- COMMUNICATION (WITH 10s TIMEOUT)
 -- =====================================================================
 local StateSync = {}
-function StateSync.sendToBrain(worldState, message, playerName)
+
+-- New safe HTTP request that cannot freeze the game
+function StateSync.sendToBrainSafe(worldState, message, playerName)
     local payload = HttpService:JSONEncode({ environment = worldState, last_message = message, player_name = playerName })
-    local success, response = pcall(function()
-        if httpRequest then
-            return httpRequest({ Url = BACKEND_URL, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload, Timeout = 20 })
-        else
-            return HttpService:PostAsync(BACKEND_URL, payload, Enum.HttpContentType.ApplicationJson)
+    local result = nil
+    local finished = false
+    
+    local thread = coroutine.running()
+    
+    task.spawn(function()
+        local success, response = pcall(function()
+            if httpRequest then
+                return httpRequest({ Url = BACKEND_URL, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload, Timeout = 10 })
+            else
+                return HttpService:PostAsync(BACKEND_URL, payload, Enum.HttpContentType.ApplicationJson)
+            end
+        end)
+        if success and response then
+            local body = httpRequest and response.Body or response
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if ok then result = data end
+        end
+        finished = true
+        if coroutine.status(thread) ~= "dead" then task.spawn(coroutine.resume, thread) end
+    end)
+    
+    -- 10 second hard timeout to break deep thinking loops
+    task.delay(10, function()
+        if not finished then
+            print("Leafy Safety: Breaking deep thinking loop after 10s.")
+            if coroutine.status(thread) ~= "dead" then task.spawn(coroutine.resume, thread) end
         end
     end)
-    if success and response then
-        local body = httpRequest and response.Body or response
-        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if ok then return data end
-    end
-    return nil
+    
+    coroutine.yield()
+    return result
 end
 
 local isLeafyTalking = false 
 function StateSync.speakInGame(text)
     if not text or text == "" then return end
-    
-    -- FINAL FILTER: Strip <think> tags and JSON brackets before sending to Roblox chat
-    text = text:gsub("<think>.-</think>", "")
-    text = text:gsub("</?think>", "")
-    text = text:gsub("{.-}", "")
-    
     text = text:match("^%s*(.-)%s*$")
     if text == "" then return end
     if #text > 200 then text = text:sub(1, 197) .. "..." end
-    
     isLeafyTalking = true
     task.spawn(function()
         pcall(function()
@@ -376,17 +388,13 @@ task.spawn(function()
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if hum and isAdrenalineMode then
             if hum.Health < lastHealth and hum.Health > 0 then
-                -- Took damage
                 if hum.Health < 20 then
                     NavigationEngine.retreat()
                 else
-                    -- Engage threat
-                    local threat = getNearestPlayer(30, true) -- Excludes Developer
+                    local threat = getNearestPlayer(30, true)
                     if threat then
                         local threatTool = threat.Character:FindFirstChildOfClass("Tool")
                         local threatToolName = threatTool and threatTool.Name or "fists"
-                        
-                        -- Tell the brain who attacked us
                         local ws = DigitalAwareness.scanEnvironment()
                         if ws then
                             ws.took_damage = true
@@ -394,10 +402,9 @@ task.spawn(function()
                             ws.attacker_weapon = threatToolName
                             task.spawn(function()
                                 local prompt = "[SYSTEM ADRENALINE ALERT: I was just attacked by " .. threat.Name .. " holding a " .. threatToolName .. "!]"
-                                StateSync.sendToBrain(ws, prompt, "System")
+                                StateSync.sendToBrainSafe(ws, prompt, "System")
                             end)
                         end
-                        
                         NavigationEngine.stopAll()
                         NavigationEngine.attackPlayer(threat.Name)
                     end
@@ -422,7 +429,6 @@ local function equipItem(itemName)
     return false
 end
 
--- AUTO RE-EQUIP & RESPAWN RESET
 task.spawn(function()
     while true do
         task.wait(2)
@@ -437,19 +443,15 @@ end)
 
 -- CRITICAL FIX: RESET ALL STATES ON DEATH/RESPAWN
 LocalPlayer.CharacterAdded:Connect(function(newChar)
-    -- Wait for the new character to load properly
     newChar:WaitForChild("Humanoid")
     newChar:WaitForChild("HumanoidRootPart")
-    
-    -- Hard reset all AI states to prevent bugs after death
     NavigationEngine.stopAll()
     VirtualKeyboard.releaseAllKeys()
     isThinking = false
     isLeafyTalking = false
     lastHealth = 100
     lastEquippedTool = nil
-    
-    task.wait(2) -- Brief pause to ensure stability before he acts again
+    task.wait(2)
     StateSync.speakInGame("I'm back online! 🤖")
 end)
 
@@ -508,7 +510,7 @@ local function onPlayerChatted(player, message)
         if not worldState then isThinking = false; return end
         local prompt = player.Name .. " said: " .. message
         
-        local response = StateSync.sendToBrain(worldState, prompt, player.Name)
+        local response = StateSync.sendToBrainSafe(worldState, prompt, player.Name)
         
         if response then
             if response.chat and response.chat ~= "" then
@@ -539,6 +541,8 @@ local function onPlayerChatted(player, message)
                     end
                 end
             end
+        else
+            print("Leafy: No response (Timeout or Error).")
         end
         task.wait(1)
         isThinking = false
