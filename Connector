@@ -1,0 +1,557 @@
+-- =====================================================================
+-- LeafyAI Unified Client (Death Reset, Thought Leak Fix, Adrenaline)
+-- =====================================================================
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
+local Workspace = game:GetService("Workspace")
+local PathfindingService = game:GetService("PathfindingService")
+
+local LocalPlayer = Players.LocalPlayer
+local DEVELOPER_ID = 11254642791 
+local DEVELOPER_NAME = "RealOrcaDev"
+
+local BACKEND_URL = "https://leafyai.onrender.com/think"
+local httpRequest = (syn and syn.request) or (http and http.request) or (request ~= nil and request) or nil
+
+local isGlobalMode = false
+local isAdrenalineMode = false
+local lastHealth = 100
+local lastEquippedTool = nil
+local heldKeys = {}
+
+-- =====================================================================
+-- DIGITAL AWARENESS & RAYCAST MAP
+-- =====================================================================
+local DigitalAwareness = {}
+
+function DigitalAwareness.scanEnvironment()
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local rootPart = char.HumanoidRootPart
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    
+    local map = {
+        position = {x = rootPart.Position.X, y = rootPart.Position.Y, z = rootPart.Position.Z},
+        health = math.floor(hum.Health),
+        maxHealth = math.floor(hum.MaxHealth),
+        took_damage = false,
+        attacker_name = "none",
+        attacker_weapon = "none",
+        equipped_tool = "none",
+        inventory = {},
+        digital_map = {self = "green", players = {}},
+        wall_distances = {}
+    }
+    
+    if hum.Health < lastHealth then 
+        map.took_damage = true 
+    end
+    lastHealth = hum.Health
+    
+    local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if bp then
+        for _, tool in ipairs(bp:GetChildren()) do
+            if tool:IsA("Tool") then table.insert(map.inventory, tool.Name) end
+        end
+    end
+    local equipped = char:FindFirstChildOfClass("Tool")
+    if equipped then
+        map.equipped_tool = equipped.Name
+        lastEquippedTool = equipped.Name
+    end
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local pRoot = player.Character.HumanoidRootPart
+            local distance = (pRoot.Position - rootPart.Position).Magnitude
+            if distance <= 100 then
+                local offset = pRoot.Position - rootPart.Position
+                local color = "red"
+                if player.Name == DEVELOPER_NAME or player.UserId == DEVELOPER_ID then color = "brown" end
+                table.insert(map.digital_map.players, {
+                    name = player.Name, color = color, dist = math.floor(distance),
+                    x = math.floor(offset.X), z = math.floor(offset.Z)
+                })
+            end
+        end
+    end
+    
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterDescendantsInstances = {char}
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    local directions = {
+        Front = rootPart.CFrame.LookVector, Back = -rootPart.CFrame.LookVector,
+        Left = -rootPart.CFrame.RightVector, Right = rootPart.CFrame.RightVector,
+        FrontLeft = (rootPart.CFrame.LookVector - rootPart.CFrame.RightVector).Unit,
+        FrontRight = (rootPart.CFrame.LookVector + rootPart.CFrame.RightVector).Unit,
+        BackLeft = (-rootPart.CFrame.LookVector - rootPart.CFrame.RightVector).Unit,
+        BackRight = (-rootPart.CFrame.LookVector + rootPart.CFrame.RightVector).Unit
+    }
+    for dirName, dirVector in pairs(directions) do
+        local result = Workspace:Raycast(rootPart.Position, dirVector * 50, raycastParams)
+        if result then
+            map.wall_distances[dirName] = math.floor((result.Position - rootPart.Position).Magnitude)
+        else
+            map.wall_distances[dirName] = 50
+        end
+    end
+    return map
+end
+
+-- =====================================================================
+-- COMMUNICATION
+-- =====================================================================
+local StateSync = {}
+function StateSync.sendToBrain(worldState, message, playerName)
+    local payload = HttpService:JSONEncode({ environment = worldState, last_message = message, player_name = playerName })
+    local success, response = pcall(function()
+        if httpRequest then
+            return httpRequest({ Url = BACKEND_URL, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload, Timeout = 20 })
+        else
+            return HttpService:PostAsync(BACKEND_URL, payload, Enum.HttpContentType.ApplicationJson)
+        end
+    end)
+    if success and response then
+        local body = httpRequest and response.Body or response
+        local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if ok then return data end
+    end
+    return nil
+end
+
+local isLeafyTalking = false 
+function StateSync.speakInGame(text)
+    if not text or text == "" then return end
+    
+    -- FINAL FILTER: Strip <think> tags and JSON brackets before sending to Roblox chat
+    text = text:gsub("<think>.-</think>", "")
+    text = text:gsub("</?think>", "")
+    text = text:gsub("{.-}", "")
+    
+    text = text:match("^%s*(.-)%s*$")
+    if text == "" then return end
+    if #text > 200 then text = text:sub(1, 197) .. "..." end
+    
+    isLeafyTalking = true
+    task.spawn(function()
+        pcall(function()
+            local channels = TextChatService:FindFirstChild("TextChannels")
+            local ch = (channels and channels:FindFirstChild("RBXGeneral")) or (TextChatService.ChatInputBarConfiguration and TextChatService.ChatInputBarConfiguration.TargetTextChannel)
+            if ch then ch:SendAsync(text) end
+        end)
+        pcall(function()
+            local evts = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+            if evts then
+                local sayMsg = evts:FindFirstChild("SayMessageRequest")
+                if sayMsg then sayMsg:FireServer(text, "All") end
+            end
+        end)
+        task.wait(1.5)
+        isLeafyTalking = false
+    end)
+end
+
+-- =====================================================================
+-- VIRTUAL INPUT
+-- =====================================================================
+local VirtualKeyboard = {}
+function VirtualKeyboard.getKeyCode(keyName)
+    if not keyName or type(keyName) ~= "string" then return nil end
+    local success, keyCode = pcall(function() return Enum.KeyCode[keyName] end)
+    if success and keyCode then return keyCode end
+    local formatted = keyName:sub(1,1):upper() .. keyName:sub(2):lower()
+    success, keyCode = pcall(function() return Enum.KeyCode[formatted] end)
+    if success and keyCode then return keyCode end
+    return nil
+end
+
+function VirtualKeyboard.holdKeyToggle(keyName)
+    local keyCode = VirtualKeyboard.getKeyCode(keyName)
+    if not keyCode then return end
+    if not heldKeys[keyName] then
+        heldKeys[keyName] = true
+        pcall(function() VirtualInputManager:SendKeyEvent(true, keyCode, false, game) end)
+    end
+end
+
+function VirtualKeyboard.releaseKey(keyName)
+    local keyCode = VirtualKeyboard.getKeyCode(keyName)
+    if not keyCode then return end
+    if heldKeys[keyName] then
+        heldKeys[keyName] = nil
+        pcall(function() VirtualInputManager:SendKeyEvent(false, keyCode, false, game) end)
+    end
+end
+
+function VirtualKeyboard.releaseAllKeys()
+    for keyName, _ in pairs(heldKeys) do VirtualKeyboard.releaseKey(keyName) end
+end
+
+function VirtualKeyboard.pressKey(keyName, duration)
+    local keyCode = VirtualKeyboard.getKeyCode(keyName)
+    if not keyCode then return end
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+        task.delay(duration or 0.5, function() VirtualInputManager:SendKeyEvent(false, keyCode, false, game) end)
+    end)
+end
+
+local VirtualMouse = {}
+function VirtualMouse.click()
+    pcall(function()
+        VirtualUser:Button1Down(Vector2.new(0, 0))
+        task.wait(0.1)
+        VirtualUser:Button1Up(Vector2.new(0, 0))
+    end)
+end
+
+-- =====================================================================
+-- NAVIGATION & ADRENALINE ENGINE
+-- =====================================================================
+local NavigationEngine = {}
+local currentTask = "idle" 
+local currentTarget = nil
+
+local function findPlayer(nameStr)
+    if not nameStr then return nil end
+    local lower = nameStr:lower()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == lower or p.DisplayName:lower() == lower then return p end
+    end
+    return nil
+end
+
+local function getNearestPlayer(maxDist, excludeDev)
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local root = char.HumanoidRootPart
+    local nearest, minDist = nil, maxDist or 9999
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            if excludeDev and (p.UserId == DEVELOPER_ID or p.Name == DEVELOPER_NAME) then continue end
+            if p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                local dist = (p.Character.HumanoidRootPart.Position - root.Position).Magnitude
+                if dist < minDist then
+                    minDist = dist
+                    nearest = p
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+local function attackTarget()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then tool:Activate() else VirtualMouse.click() end
+end
+
+function NavigationEngine.stopAll()
+    currentTask = "idle"
+    currentTarget = nil
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum then hum:MoveTo(char.HumanoidRootPart.Position) end
+end
+
+function NavigationEngine.followPlayer(targetName)
+    local targetPlayer = findPlayer(targetName)
+    if not targetPlayer then return end
+    currentTask = "following"
+    currentTarget = targetPlayer
+    task.spawn(function()
+        while currentTask == "following" and currentTarget do
+            local char = LocalPlayer.Character
+            if not char or not char:FindFirstChild("HumanoidRootPart") then break end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local root = char.HumanoidRootPart
+            if not currentTarget.Character or not currentTarget.Character:FindFirstChild("HumanoidRootPart") then break end
+            local targetRoot = currentTarget.Character.HumanoidRootPart
+            local distance = (targetRoot.Position - root.Position).Magnitude
+            if distance > 5 then
+                local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true})
+                local ok = pcall(function() path:ComputeAsync(root.Position, targetRoot.Position) end)
+                if currentTask ~= "following" then break end
+                if ok and path.Status == Enum.PathStatus.Success then
+                    local waypoints = path:GetWaypoints()
+                    for i=2, #waypoints do
+                        if currentTask ~= "following" then break end
+                        local wp = waypoints[i]
+                        if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+                        hum:MoveTo(wp.Position)
+                        local timeout = tick() + 0.5
+                        repeat task.wait() until (root.Position - wp.Position).Magnitude < 4 or tick() > timeout or currentTask ~= "following"
+                    end
+                else
+                    hum:MoveTo(targetRoot.Position)
+                end
+            else
+                hum:MoveTo(root.Position)
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
+function NavigationEngine.attackPlayer(targetName)
+    local targetPlayer = findPlayer(targetName)
+    if not targetPlayer then return end
+    currentTask = "attacking"
+    currentTarget = targetPlayer
+    task.spawn(function()
+        while currentTask == "attacking" and currentTarget do
+            local char = LocalPlayer.Character
+            if not char or not char:FindFirstChild("HumanoidRootPart") then break end
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            local root = char.HumanoidRootPart
+            if not currentTarget.Character or not currentTarget.Character:FindFirstChild("HumanoidRootPart") or currentTarget.Character.Humanoid.Health <= 0 then break end
+            local targetRoot = currentTarget.Character.HumanoidRootPart
+            local distance = (targetRoot.Position - root.Position).Magnitude
+            if distance > 5 then
+                local path = PathfindingService:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true})
+                local ok = pcall(function() path:ComputeAsync(root.Position, targetRoot.Position) end)
+                if currentTask ~= "attacking" then break end
+                if ok and path.Status == Enum.PathStatus.Success then
+                    local waypoints = path:GetWaypoints()
+                    for i=2, #waypoints do
+                        if currentTask ~= "attacking" then break end
+                        local wp = waypoints[i]
+                        if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+                        hum:MoveTo(wp.Position)
+                        local timeout = tick() + 0.5
+                        repeat task.wait() until (root.Position - wp.Position).Magnitude < 4 or tick() > timeout or currentTask ~= "attacking"
+                        if (currentTarget.Character.HumanoidRootPart.Position - root.Position).Magnitude <= 5 then break end
+                    end
+                else
+                    hum:MoveTo(targetRoot.Position)
+                end
+            else
+                hum:MoveTo(root.Position)
+                root.CFrame = CFrame.lookAt(root.Position, Vector3.new(targetRoot.Position.X, root.Position.Y, targetRoot.Position.Z))
+                attackTarget()
+                task.wait(0.3)
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+
+function NavigationEngine.retreat()
+    currentTask = "retreating"
+    task.spawn(function()
+        StateSync.speakInGame("Health critical! Retreating!")
+        while currentTask == "retreating" do
+            local char = LocalPlayer.Character
+            if not char or not char:FindFirstChild("HumanoidRootPart") or not char:FindFirstChildOfClass("Humanoid") then break end
+            local hum = char.Humanoid
+            local root = char.HumanoidRootPart
+            
+            if hum.Health >= 20 then
+                currentTask = "idle"
+                break
+            end
+            
+            local threat = getNearestPlayer(100, true)
+            if threat and threat.Character and threat.Character:FindFirstChild("HumanoidRootPart") then
+                local threatRoot = threat.Character.HumanoidRootPart
+                local awayVec = (root.Position - threatRoot.Position).Unit
+                local safeSpot = root.Position + (awayVec * 40)
+                hum:MoveTo(safeSpot)
+            end
+            task.wait(0.5)
+        end
+    end)
+end
+
+-- ADRENALINE REFLEX LOOP
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum and isAdrenalineMode then
+            if hum.Health < lastHealth and hum.Health > 0 then
+                -- Took damage
+                if hum.Health < 20 then
+                    NavigationEngine.retreat()
+                else
+                    -- Engage threat
+                    local threat = getNearestPlayer(30, true) -- Excludes Developer
+                    if threat then
+                        local threatTool = threat.Character:FindFirstChildOfClass("Tool")
+                        local threatToolName = threatTool and threatTool.Name or "fists"
+                        
+                        -- Tell the brain who attacked us
+                        local ws = DigitalAwareness.scanEnvironment()
+                        if ws then
+                            ws.took_damage = true
+                            ws.attacker_name = threat.Name
+                            ws.attacker_weapon = threatToolName
+                            task.spawn(function()
+                                local prompt = "[SYSTEM ADRENALINE ALERT: I was just attacked by " .. threat.Name .. " holding a " .. threatToolName .. "!]"
+                                StateSync.sendToBrain(ws, prompt, "System")
+                            end)
+                        end
+                        
+                        NavigationEngine.stopAll()
+                        NavigationEngine.attackPlayer(threat.Name)
+                    end
+                end
+            end
+            lastHealth = hum.Health
+        end
+    end
+end)
+
+local function equipItem(itemName)
+    local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local char = LocalPlayer.Character
+    if bp and char then
+        for _, tool in ipairs(bp:GetChildren()) do
+            if tool:IsA("Tool") and tool.Name:lower() == itemName:lower() then
+                char.Humanoid:EquipTool(tool)
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- AUTO RE-EQUIP & RESPAWN RESET
+task.spawn(function()
+    while true do
+        task.wait(2)
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local equipped = char and char:FindFirstChildOfClass("Tool")
+        if hum and hum.Health > 0 and not equipped and lastEquippedTool then
+            equipItem(lastEquippedTool)
+        end
+    end
+end)
+
+-- CRITICAL FIX: RESET ALL STATES ON DEATH/RESPAWN
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    -- Wait for the new character to load properly
+    newChar:WaitForChild("Humanoid")
+    newChar:WaitForChild("HumanoidRootPart")
+    
+    -- Hard reset all AI states to prevent bugs after death
+    NavigationEngine.stopAll()
+    VirtualKeyboard.releaseAllKeys()
+    isThinking = false
+    isLeafyTalking = false
+    lastHealth = 100
+    lastEquippedTool = nil
+    
+    task.wait(2) -- Brief pause to ensure stability before he acts again
+    StateSync.speakInGame("I'm back online! 🤖")
+end)
+
+-- =====================================================================
+-- CHAT LISTENER
+-- =====================================================================
+local isThinking = false
+
+local function onPlayerChatted(player, message)
+    if player == LocalPlayer then return end
+    
+    if player.UserId == DEVELOPER_ID then
+        if message:sub(1, 3) == "/e " then
+            if message:sub(1, 7) == "/e say " then
+                StateSync.speakInGame(message:sub(8))
+            elseif message == "/e kill" then
+                pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
+            elseif message == "/e shutdown" then
+                LocalPlayer:Kick("LeafyAI shut down by Developer.")
+            end
+            return
+        elseif message == ".py global" then
+            isGlobalMode = true
+            StateSync.speakInGame("Global mode activated.")
+            return
+        elseif message == ".py private" then
+            isGlobalMode = false
+            StateSync.speakInGame("Private mode activated.")
+            return
+        elseif message == ".py adrenaline true" then
+            isAdrenalineMode = true
+            StateSync.speakInGame("Adrenaline reflex activated. I will defend myself.")
+            return
+        elseif message == ".py adrenaline false" then
+            isAdrenalineMode = false
+            StateSync.speakInGame("Adrenaline reflex disabled.")
+            return
+        end
+    end
+    
+    if not isGlobalMode and player.UserId ~= DEVELOPER_ID then return end
+    if isGlobalMode then
+        local myChar = LocalPlayer.Character
+        local theirChar = player.Character
+        if myChar and theirChar and myChar:FindFirstChild("HumanoidRootPart") and theirChar:FindFirstChild("HumanoidRootPart") then
+            local dist = (theirChar.HumanoidRootPart.Position - myChar.HumanoidRootPart.Position).Magnitude
+            if dist > 20 then return end
+        end
+    end
+    
+    if isThinking or isLeafyTalking then return end
+    isThinking = true
+    
+    task.spawn(function()
+        local worldState = DigitalAwareness.scanEnvironment()
+        if not worldState then isThinking = false; return end
+        local prompt = player.Name .. " said: " .. message
+        
+        local response = StateSync.sendToBrain(worldState, prompt, player.Name)
+        
+        if response then
+            if response.chat and response.chat ~= "" then
+                StateSync.speakInGame(response.chat)
+            end
+            if response.actions and type(response.actions) == "table" then
+                for _, action in ipairs(response.actions) do
+                    if action.type == "follow" then
+                        NavigationEngine.followPlayer(action.target)
+                    elseif action.type == "stop_follow" then
+                        NavigationEngine.stopAll()
+                        VirtualKeyboard.releaseAllKeys()
+                    elseif action.type == "attack_player" then
+                        NavigationEngine.attackPlayer(action.target)
+                    elseif action.type == "stop_attack" then
+                        NavigationEngine.stopAll()
+                    elseif action.type == "key_hold" then
+                        NavigationEngine.stopAll()
+                        VirtualKeyboard.holdKeyToggle(action.key)
+                    elseif action.type == "key_release" then
+                        VirtualKeyboard.releaseKey(action.key)
+                    elseif action.type == "key_press" then
+                        VirtualKeyboard.pressKey(action.key, action.duration or 0.5)
+                    elseif action.type == "mouse_click" then
+                        VirtualMouse.click()
+                    elseif action.type == "equip" then
+                        equipItem(action.item)
+                    end
+                end
+            end
+        end
+        task.wait(1)
+        isThinking = false
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    p.Chatted:Connect(function(msg) onPlayerChatted(p, msg) end)
+end
+Players.PlayerAdded:Connect(function(p)
+    p.Chatted:Connect(function(msg) onPlayerChatted(p, msg) end)
+end)
+
+task.delay(3, function()
+    StateSync.speakInGame("LeafyAI online. Adrenaline systems ready.")
+end)
